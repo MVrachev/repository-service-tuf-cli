@@ -145,9 +145,13 @@ class MetadataInfo:
         return online_key_dict
 
     def __init__(self, root_md: Metadata[Root]):
-        self._new_md = root_md
+        # Every key must have a name so that users can easily distinguish them
+        for key in root_md.signed.keys.values():
+            MetadataInfo._set_key_name(key)
+
+        self._new_md: Metadata[Root] = root_md
         self.signing_keys = {}
-        self._trusted_md = copy.deepcopy(self._new_md)
+        self._trusted_md: Metadata[Root] = copy.deepcopy(self._new_md)
 
     @staticmethod
     def _get_key_name(key: Key) -> str:
@@ -156,6 +160,10 @@ class MetadataInfo:
             name = key.unrecognized_fields["name"]
 
         return name
+
+    @staticmethod
+    def _set_key_name(key: Key):
+        key.unrecognized_fields["name"] = MetadataInfo._get_key_name(key)
 
     def _get_pending_and_used_keys(
         self,
@@ -183,8 +191,7 @@ class MetadataInfo:
     def save_current_md_key(self, key: RSTUFKey):
         """Update internal information based on 'key' data."""
         tuf_key: Key = self._new_md.signed.keys[key.key["keyid"]]
-        if tuf_key.unrecognized_fields.get("name"):
-            key.name = tuf_key.unrecognized_fields["name"]
+        key.name = MetadataInfo._get_key_name(tuf_key)
 
         self.signing_keys[key.key["keyid"]] = key
 
