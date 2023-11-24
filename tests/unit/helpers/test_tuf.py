@@ -212,7 +212,7 @@ class TestMetadataInfo:
         with open("tests/files/das-root.json", "r") as f:
             das_root = json.loads(f.read())
 
-        md_info = MetadataInfo(Metadata.from_dict(das_root["root"]))
+        md_info = MetadataInfo(Metadata.from_dict(das_root))
         used_keys_info, pending_keys = md_info._get_pending_and_used_keys()
         assert len(used_keys_info) == 1
         assert used_keys_info[0] == {
@@ -245,6 +245,35 @@ class TestMetadataInfo:
         root.signed.add_key(Key("id2", "ed25519", "", {}), "timestamp")
         root_info = MetadataInfo(root)
         assert root_info.is_keyid_used("id") is False
+
+    def test_is_name_used_in_any_root_keyid_in_new_root(
+        self, root: Metadata[Root]
+    ):
+        root_info = MetadataInfo(root)
+        root_info._new_md.signed.add_key(Key("id2", "ed25519", "", {}), "root")
+        assert root_info.is_name_used_in_any_root("id2", "id2") == True  # noqa
+
+    def test_is_name_used_in_any_root_keyid_in_trusted_root(
+        self, root: Metadata[Root]
+    ):
+        root.signed.add_key(Key("id2", "ed25519", "", {}), "root")
+        root_info = MetadataInfo(root)
+        # Remove the key from new_root, so we check if it's inside trusted root
+        root_info._new_md.signed.revoke_key("id2", "root")
+        assert root_info.is_name_used_in_any_root("id2", "id2") == True  # noqa
+
+    def test_is_name_used_in_any_root_keid_not_in_any_root(
+        self, root: Metadata[Root]
+    ):
+        root_info = MetadataInfo(root)
+        assert root_info.is_name_used_in_any_root("id", "id") == False  # noqa
+
+    def test_is_name_used_in_any_root_name_does_not_match(
+        self, root: Metadata[Root]
+    ):
+        root_info = MetadataInfo(root)
+        root_info._new_md.signed.add_key(Key("id", "ed25519", "", {}), "root")
+        assert root_info.is_name_used_in_any_root("id", "foo") == False  # noqa
 
     def test_save_current_md_key(self, root_info: MetadataInfo):
         tuf_key: Key = root_info._new_md.signed.keys["id1"]

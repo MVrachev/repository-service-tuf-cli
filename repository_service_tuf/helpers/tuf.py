@@ -108,6 +108,10 @@ class MetadataInfo:
         self._new_md.signed.roles[Root.type].threshold = value
 
     @property
+    def new_root_version(self) -> int:
+        return self._new_md.signed.version
+
+    @property
     def type(self) -> str:
         return self._trusted_md.signed.type.capitalize()
 
@@ -161,10 +165,6 @@ class MetadataInfo:
 
         return name
 
-    @staticmethod
-    def _set_key_name(key: Key):
-        key.unrecognized_fields["name"] = MetadataInfo._get_key_name(key)
-
     def _get_pending_and_used_keys(
         self,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -184,9 +184,28 @@ class MetadataInfo:
 
         return used_keys_info, pending_keys_info
 
+    def set_new_root(self, new_root: Metadata[Root]):
+        self._new_md = new_root
+
+    @staticmethod
+    def _set_key_name(key: Key):
+        key.unrecognized_fields["name"] = MetadataInfo._get_key_name(key)
+
     def is_keyid_used(self, keyid: str) -> bool:
-        """Check if keyid is used in root keys"""
+        """Check if keyid is used in new root keys"""
         return keyid in self._new_md.signed.roles[Root.type].keyids
+
+    def is_name_used_in_any_root(self, keyid: str, name: str) -> bool:
+        """Is keyid used in new_root or trusted_root"""
+        key: Key
+        if keyid in self._new_md.signed.roles[Root.type].keyids:
+            key = self._new_md.signed.keys[keyid]
+        elif keyid in self._trusted_md.signed.roles[Root.type].keyids:
+            key = self._trusted_md.signed.keys[keyid]
+        else:
+            return False
+
+        return MetadataInfo._get_key_name(key) == name
 
     def save_current_md_key(self, key: RSTUFKey):
         """Update internal information based on 'key' data."""

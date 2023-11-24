@@ -4,11 +4,12 @@
 import copy
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich import align, box, markdown, prompt, table, text
+from rich.style import Style
 from securesystemslib.exceptions import StorageError  # type: ignore
-from securesystemslib.signer import Signature  # type: ignore
+from securesystemslib.signer import Key, Signature  # type: ignore
 from tuf.api.metadata import Metadata, Root
 from tuf.api.serialization import DeserializationError
 
@@ -157,7 +158,7 @@ def _create_keys_table(
     for key in keys:
         keys_table.add_row(
             f"[yellow]{key['keyid']}",
-            f'[yellow]{key["name"]}',
+            text.Text(key["name"], style=Style(color="magenta", bold=True)),
             key["keytype"],
             keys_location,
             f'[yellow]{key["keyval"]["public"]}',
@@ -167,10 +168,13 @@ def _create_keys_table(
 
 
 def _print_md_info_helper(
-    table: table.Table, keys: List[Dict[str, Any]], title: str
+    table: table.Table,
+    keys: List[Dict[str, Any]],
+    title: str,
+    offline_keys: bool = True,
 ):
-    table.add_row(text.Text(f"{title}", style="b cyan", justify="center"))
-    pending_keys_table = _create_keys_table(keys, True, False)
+    table.add_row(text.Text(title, style="b cyan", justify="center"))
+    pending_keys_table = _create_keys_table(keys, offline_keys, False)
     table.add_row(pending_keys_table)
 
 
@@ -182,9 +186,13 @@ def _print_md_info(md_info: MetadataInfo, trusted_md: Optional[bool] = True):
 
     if not trusted_md:
         # This role is not yet trusted, not all keys were used for signing.
-        used_keys, pending_keys = md_info._get_pending_and_used_keys()
-        _print_md_info_helper(md_keys_table, used_keys, "\nSIGNING KEYS")
-        _print_md_info_helper(md_keys_table, pending_keys, "\nPENDING KEYS")
+        _print_md_info_helper(md_keys_table, md_info.keys, "\nRoot Key(s)")
+        _print_md_info_helper(
+            md_keys_table,
+            [md_info.online_key],
+            "\nOnline Key (used for Timestamp/Snapshot/Target roles)",
+            False,
+        )
     else:
         keys = md_info.keys
         md_signing_keys_table = _create_keys_table(keys, True, True)
@@ -192,9 +200,9 @@ def _print_md_info(md_info: MetadataInfo, trusted_md: Optional[bool] = True):
 
     md_table.add_row(
         (
-            f"\nNumber of Keys: [yellow]{len(md_info.keys)}[/]"
-            f"\nThreshold: [yellow]{md_info.threshold}[/]"
+            f"\n{md_info.type} Threshold: [yellow]{md_info.threshold}[/]"
             f"\n{md_info.type} Expiration: [yellow]{md_info.expiration_str}[/]"
+            f"\n{md_info.type} Version: [yellow]{md_info.new_root_version}[/]"
         ),
         md_keys_table,
     )
@@ -598,9 +606,9 @@ def update(
         console.print("\nNo file will be generated as no changes were made\n")
 
 
-def _get_pending_roles(
+def _get_pending_and_trusted_roles(
     settings: Any, api_server: Optional[str]
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if api_server:
         settings.SERVER = api_server
 
@@ -620,51 +628,96 @@ def _get_pending_roles(
     if response_data is None:
         raise click.ClickException(response.text)
 
-    pending_roles: Dict[str, Any] = response_data.get("metadata", {})
-    if len(pending_roles) == 0:
+    all_roles: Dict[str, Any] = response_data.get("metadata", {})
+    if len(all_roles) == 0:
         raise click.ClickException("No metadata available for signing")
 
-    return pending_roles
+    pending_roles: Dict[str, Any] = {}
+    trusted_roles: Dict[str, Any] = {}
+    for name, role_data in all_roles.items():
+        if name.startswith("trusted"):
+            trusted_roles[name] = role_data
+        else:
+            pending_roles[name] = role_data
+
+    return pending_roles, trusted_roles
 
 
-def _get_signing_key(role_info: MetadataInfo) -> RSTUFKey:
-    pending_keys: List = []
-    for key_id in role_info._new_md.signed.roles[Root.type].keyids:
-        if key_id not in role_info._new_md.signatures:
-            pending_keys.append(role_info._new_md.signed.keys[key_id])
-
-    sign_key_name = prompt.Prompt.ask(
-        "\nChoose a private key to load",
-        choices=[
-            signing_key.unrecognized_fields.get("name", signing_key.keyid[:7])
-            for signing_key in pending_keys
-        ],
+def _get_pending_signing_keys(
+    role_info: MetadataInfo,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    trusted_result = role_info._trusted_md.signed.get_verification_result(
+        Root.type,
+        role_info._new_md.signed_bytes,
+        role_info._new_md.signatures,
+    )
+    new_result = role_info._new_md.signed.get_verification_result(
+        Root.type, role_info._new_md.signed_bytes, role_info._new_md.signatures
     )
 
+    eligible_keyids = trusted_result.unsigned | new_result.unsigned
+
+    new_pending_keys: List[Dict[str, Any]] = []
+    trusted_pending_keys: List[Dict[str, Any]] = []
+    key: Key
+    for keyid in eligible_keyids:
+        if keyid in trusted_result.unsigned:
+            key = role_info._new_md.signed.keys[keyid]
+            key_dict = key.to_dict()
+            trusted_pending_keys.append(key_dict)
+        else:
+            # Key coming from new root and not part of trusted root.
+            key = role_info._trusted_md.signed.keys[keyid]
+            key_dict = key.to_dict()
+            new_pending_keys.append(key_dict)
+
+        # This will also update the key_dict just added in one of the lists.
+        key_dict["keyid"] = keyid
+        key_dict["name"] = role_info._get_key_name(key)
+
+    return new_pending_keys, trusted_pending_keys
+
+
+def _print_pending_keys(pending_keys: List[Dict[str, Any]]):
+    title = f"Root role still needs {len(pending_keys)} key(s) from any of"
+    md_table = table.Table()
+    md_table.add_column(
+        text.Text(title, style="b cyan", justify="center"),
+        justify="center",
+        vertical="middle",
+    )
+    pending_table = _create_keys_table(pending_keys, True, True)
+    md_table.add_row(pending_table)
+    console.print(md_table)
+    console.print("\n")
+
+
+def _get_signing_key(
+    pending_keys: List[Dict[str, Any]], role_info: MetadataInfo
+) -> RSTUFKey:
+    pending_names = [key_dict["name"] for key_dict in pending_keys]
     while True:
+        sign_key_name = prompt.Prompt.ask(
+            "\nChoose a private key to load",
+            choices=pending_names,
+        )
         rstuf_key: RSTUFKey = get_key(sign_key_name)
         if rstuf_key.error:
             console.print(rstuf_key.error)
-            retry = prompt.Confirm.ask(
-                f"\nRetry to load the key {sign_key_name}?"
-            )
+            retry = prompt.Confirm.ask("\nRetry to load a key?")
             if not retry:
                 console.print("Aborted.")
                 sys.exit(0)
+            else:
+                continue
+
+        keyid = rstuf_key.key["keyid"]
+        if not role_info.is_name_used_in_any_root(keyid, sign_key_name):
+            console.print(f"Loaded key is not '{sign_key_name}'")
+            continue
         else:
-            break
-
-    rstuf_key_id = rstuf_key.key["keyid"]
-
-    current_role_key = role_info._new_md.signed.keys[rstuf_key_id]
-    current_role_key_name = current_role_key.unrecognized_fields.get(
-        "name", current_role_key.keyid[:7]
-    )
-    if current_role_key_name != sign_key_name:
-        raise click.ClickException(f"Loaded key is not '{sign_key_name}'")
-
-    rstuf_key.name = current_role_key_name
-    return rstuf_key
+            rstuf_key.name = sign_key_name
+            return rstuf_key
 
 
 def _sign_metadata(role_info: MetadataInfo, rstuf_key: RSTUFKey) -> Signature:
@@ -698,7 +751,9 @@ def sign(context, api_server: Optional[str], delete: Optional[bool]) -> None:
 
     settings = context.obj["settings"]
 
-    pending_roles = _get_pending_roles(settings, api_server)
+    pending_roles, trusted_roles = _get_pending_and_trusted_roles(
+        settings, api_server
+    )
     role_info: MetadataInfo
     rolename: str
 
@@ -721,6 +776,7 @@ def sign(context, api_server: Optional[str], delete: Optional[bool]) -> None:
             f"\nDo you still want to {msg} {rolename}?"
         )
         if confirmation:
+            console.print("\n")
             break
 
     if delete:
@@ -736,12 +792,22 @@ def sign(context, api_server: Optional[str], delete: Optional[bool]) -> None:
         console.print("\nSigning process deleted!\n")
         return
 
-    console.print(
-        f"Signing [cyan]{rolename}[/] version "
-        f"{role_info._new_md.signed.version}"
-    )
+    trusted_role = trusted_roles.get(f"trusted_{rolename}")
+    # If trusted_role is None this means 'rolename' is the first version.
+    if trusted_role is not None and len(trusted_role) > 0:
+        role_info._trusted_md = Metadata.from_dict(trusted_role)
 
-    rstuf_key = _get_signing_key(role_info)
+    new_pending_keys, trusted_pending_keys = _get_pending_signing_keys(
+        role_info
+    )
+    if len(trusted_pending_keys) > 0:
+        _print_pending_keys(trusted_pending_keys)
+
+    if len(new_pending_keys) > 0:
+        _print_pending_keys(new_pending_keys)
+
+    all_possible_root_keys = trusted_pending_keys + new_pending_keys
+    rstuf_key = _get_signing_key(all_possible_root_keys, role_info)
     signature = _sign_metadata(role_info, rstuf_key)
 
     payload = {"role": rolename, "signature": signature.to_dict()}
