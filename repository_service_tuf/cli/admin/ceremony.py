@@ -12,7 +12,6 @@ from rich import box, markdown, prompt, table  # type: ignore
 
 from repository_service_tuf.cli import click, console
 from repository_service_tuf.cli.admin import admin
-from repository_service_tuf.constants import SCHEME_DEFAULTS, KeyType
 from repository_service_tuf.helpers.api_client import (
     URL,
     bootstrap_status,
@@ -25,9 +24,7 @@ from repository_service_tuf.helpers.tuf import (
     RSTUFKey,
     ServiceSettings,
     TUFManagement,
-    _conform_rsa_key,
-    get_key,
-    get_supported_schemes_for_key_type,
+    get_rstuf_key,
     load_payload,
     save_payload,
 )
@@ -345,94 +342,13 @@ def _configure_role(role: Roles) -> None:
 def _configure_keys(
     role: str, number_of_keys: int
 ) -> Generator[RSTUFKey, None, None]:
-    role_cyan = click.style(role, fg="cyan")
     key_count = 1
     while key_count <= number_of_keys:
         console.print(
             f"\n🔑 Key {key_count}/{number_of_keys} [cyan]{role}[/]\n"
         )
 
-        if role == Roles.ROOT.value and key_count == 1:
-            signing_key = "private"
-
-        elif role == "ONLINE":
-            signing_key = "public"
-        else:
-            signing_key = prompt.Prompt.ask(
-                "[cyan]Private[/] or [cyan]Public[/] key"
-                "\n- [cyan]private key[/] requires the file path and password"
-                "\n- [cyan]public info[/] requires the a key id and key hash"
-                "\n  tip: `rstuf key info` retrieves the public information"
-                "\nSelect to use [cyan]private key[/] or [cyan]public "
-                "info[/]?",
-                choices=["private", "public"],
-                default="public",
-            )
-
-        key_type = prompt.Prompt.ask(
-            f"Choose {role_cyan}`s key type",
-            choices=KeyType.get_all_members(),
-            default=KeyType.KEY_TYPE_ED25519.value,
-        )
-        if signing_key == "private":
-            role_key: RSTUFKey = get_key(role, key_type, ask_name=True)
-            if role_key.error:
-                console.print(role_key.error)
-                continue
-
-            console.print(
-                ":white_check_mark: Key "
-                f"{key_count}/{number_of_keys} [green]Verified[/]"
-            )
-
-        else:
-            allowed_schemes = get_supported_schemes_for_key_type(key_type)
-            # No point of asking the user for choice if there is only 1 scheme.
-            if len(allowed_schemes) == 1:
-                scheme = allowed_schemes[0]
-            else:
-                scheme = prompt.Prompt.ask(
-                    f"Choose {role_cyan}`s [green]public key scheme[/]",
-                    choices=allowed_schemes,
-                    default=SCHEME_DEFAULTS[key_type],
-                )
-
-            while True:
-                keyid = prompt.Prompt.ask(
-                    f"Enter {role_cyan}`s [green]key id[/]"
-                )
-                if keyid.strip() != "":
-                    break
-
-            while True:
-                public = prompt.Prompt.ask(
-                    f"Enter {role_cyan}`s [green]public key hash[/]"
-                )
-                if public.strip() != "":
-                    if key_type == KeyType.KEY_TYPE_RSA.value:
-                        public = _conform_rsa_key(public)
-
-                    break
-
-            name = prompt.Prompt.ask(
-                f"[Optional] Give a [green]name/tag[/] to the {role_cyan} key",
-                default=keyid[:7],
-                show_default=False,
-            )
-
-            role_key = RSTUFKey(
-                key={
-                    "keytype": key_type,
-                    "scheme": scheme,
-                    "keyid": keyid,
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
-                    "keyval": {
-                        "public": public,
-                    },
-                },
-                key_path="N/A (public key only)",
-                name=name,
-            )
+        role_key = get_rstuf_key(role, key_count, number_of_keys)
 
         if role_key.key.get("keyid") is None:
             console.print(":cross_mark: [red]Failed[/]: Key `keyid` is None.")

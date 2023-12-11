@@ -10,6 +10,7 @@ from rich import align, box, markdown, prompt, table, text
 from rich.style import Style
 from securesystemslib.exceptions import StorageError  # type: ignore
 from securesystemslib.signer import Key, Signature  # type: ignore
+from tuf.api.exceptions import UnsignedMetadataError
 from tuf.api.metadata import Metadata, Root
 from tuf.api.serialization import DeserializationError
 
@@ -26,8 +27,8 @@ from repository_service_tuf.helpers.api_client import (
 from repository_service_tuf.helpers.tuf import (
     MetadataInfo,
     RSTUFKey,
-    UnsignedMetadataError,
-    get_key,
+    get_rstuf_key,
+    load_key_ask_info,
     load_payload,
     save_payload,
 )
@@ -51,16 +52,11 @@ get familiar with the current state of the root metadata file.
 AUTHORIZATION = """
 # STEP 1: Authorization
 
-Before continuing, you must authorize using the current root key(s).
+Before continuing, you must authorize yourself.
 
-In order to complete the authorization you will be asked to provide information
-about one or more keys used to sign the current root metadata.
-To complete the authorization, you must provide information about one or more
-keys used to sign the current root metadata.
-The number of required keys is based on the current "threshold".
-
-You will need local access to the keys as well as their corresponding
-passwords.
+To complete the authorization you will be asked to provide information
+about one of the keys used to sign the current root metadata.
+You will need local access to the key as well as its corresponding password.
 """
 
 EXPIRY_CHANGES_MSG = """
@@ -211,63 +207,39 @@ def _print_md_info(md_info: MetadataInfo, trusted_md: Optional[bool] = True):
     console.print("\n")
 
 
-def _is_valid_current_key(
-    keyid: str, root_info: MetadataInfo, already_loaded_keyids: List[str]
-) -> bool:
-    """Verify that key with `keyid` have been used to sign the current root"""
-    if keyid in already_loaded_keyids:
-        console.print(
-            ":cross_mark: [red]Failed[/]: You already loaded this key",
-            width=100,
-        )
-        return False
-
-    if not root_info.is_keyid_used(keyid):
-        console.print(
-            (
-                ":cross_mark: [red]Failed[/]: This key has not been used "
-                "to sign current root metadata",
-            ),
-            width=100,
-        )
-        return False
-
-    return True
-
-
 def _current_md_keys_validation(root_info: MetadataInfo):
     """
-    Authorize user by loading current root threshold number of root keys
-    used for signing the current root metadata.
+    Authorize user by loading a key used for signing the current root metadata.
     """
     console.print(markdown.Markdown(AUTHORIZATION), width=100)
-    threshold = root_info.threshold
-    console.print(f"You will need to load {threshold} key(s).")
-    loaded: List[str] = []
-    key_count = 0
-    while key_count < root_info.threshold:
-        console.print(
-            f"You will enter information for key {key_count} of {threshold}"
-        )
-        root_key: RSTUFKey = get_key(Root.type)
+    keys_loaded = 0
+    while True:
+        root_key: RSTUFKey = load_key_ask_info(Root.type)
         if root_key.error:
-            console.print(f"Failed loading key {key_count} of {threshold}")
+            console.print("Failed loading key")
             console.print(root_key.error)
             continue
 
-        keyid = root_key.key["keyid"]
-        if not _is_valid_current_key(keyid, root_info, loaded):
+        if not root_info.is_keyid_used(root_key.key["keyid"]):
+            msg = (
+                ":cross_mark: [red]Failed[/]: This key has not been used to "
+                "sign current root metadata"
+            )
+            console.print(msg, width=100)
             continue
 
-        key_count += 1
-        loaded.append(keyid)
         root_info.save_current_md_key(root_key)
-        console.print(
-            ":white_check_mark: Key "
-            f"{key_count}/{threshold} [green]Verified[/]"
+        keys_loaded += 1
+        console.print(f"Key number {keys_loaded} and verified.")
+        confirm = prompt.Confirm.ask(
+            "Do you want to load another key that will sign the new metadata?"
         )
+        if confirm:
+            continue
 
-    console.print("\n[green]Authorization is successful [/]\n", width=100)
+        break
+
+    console.print("\n[green]Authorization is successful[/]\n", width=100)
 
 
 def _keys_removal(root_info: MetadataInfo):
@@ -300,28 +272,18 @@ def _keys_removal(root_info: MetadataInfo):
 
 def _keys_additions(root_info: MetadataInfo):
     while True:
-        # Get all signing keys that are still inside the new root.
-        keys: List[Dict[str, Any]] = []
-        all_keys = root_info.keys
-        for signing_keyid, signing_key in root_info.signing_keys.items():
-            if any(signing_keyid == key["keyid"] for key in all_keys):
-                keys.append(signing_key.to_dict())
-
-        keys_table = _create_keys_table(keys, True, False)
-        console.print("\nHere are the keys that will be used for signing:")
+        keys_table = _create_keys_table(root_info.keys, True, False)
+        console.print("\nHere are all keys in the new root:")
         console.print(keys_table)
-        signing_keys_needed = root_info.new_signing_keys_required()
-        if signing_keys_needed < 1:
+        keys_needed = root_info.new_keys_required()
+        if keys_needed < 1:
             agree = prompt.Confirm.ask("\nDo you want to add a new key?")
             if not agree:
                 return
         else:
-            console.print(f"You must add {signing_keys_needed} more key(s)")
+            console.print(f"\nYou must add {keys_needed} more key(s)\n")
 
-        root_key: RSTUFKey = get_key(Root.type, "", ask_name=True)
-        if root_key.error:
-            console.print(root_key.error)
-            continue
+        root_key: RSTUFKey = get_rstuf_key(Root.type)
 
         if root_key.key["keyid"] == root_info.online_key["keyid"]:
             console.print(
@@ -427,10 +389,7 @@ def _modify_online_key(root_info: MetadataInfo):
             console.print("Skipping further online key changes")
             break
 
-        online_key: RSTUFKey = get_key("online", ask_name=True)
-        if online_key.error:
-            console.print(online_key.error)
-            continue
+        online_key: RSTUFKey = get_rstuf_key("ONLINE")
 
         if online_key.key["keyid"] == root_info.online_key["keyid"]:
             console.print(
@@ -662,12 +621,12 @@ def _get_pending_signing_keys(
     key: Key
     for keyid in eligible_keyids:
         if keyid in trusted_result.unsigned:
-            key = role_info._new_md.signed.keys[keyid]
+            key = role_info._trusted_md.signed.keys[keyid]
             key_dict = key.to_dict()
             trusted_pending_keys.append(key_dict)
         else:
             # Key coming from new root and not part of trusted root.
-            key = role_info._trusted_md.signed.keys[keyid]
+            key = role_info._new_md.signed.keys[keyid]
             key_dict = key.to_dict()
             new_pending_keys.append(key_dict)
 
@@ -701,7 +660,7 @@ def _get_signing_key(
             "\nChoose a private key to load",
             choices=pending_names,
         )
-        rstuf_key: RSTUFKey = get_key(sign_key_name)
+        rstuf_key: RSTUFKey = load_key_ask_info(sign_key_name)
         if rstuf_key.error:
             console.print(rstuf_key.error)
             retry = prompt.Confirm.ask("\nRetry to load a key?")

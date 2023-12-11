@@ -308,7 +308,7 @@ class TestMetadataInfo:
         for keyid in root_info._new_md.signed.roles["root"].keyids:
             root_info.signing_keys[keyid] = "b"
 
-        assert root_info.new_signing_keys_required() == 0
+        assert root_info.new_keys_required() == 0
 
     def test_new_signing_keys_required_threshold_not_fulfilled(
         self, root_info: MetadataInfo
@@ -317,7 +317,7 @@ class TestMetadataInfo:
         for keyid in root_info._new_md.signed.roles["root"].keyids:
             root_info.signing_keys[keyid] = "b"
 
-        assert root_info.new_signing_keys_required() == 8
+        assert root_info.new_keys_required() == 8
 
     def test_add_key(self, root_info: MetadataInfo):
         dict = {"keyid": "123", "keyval": {"sha256": "abc"}}

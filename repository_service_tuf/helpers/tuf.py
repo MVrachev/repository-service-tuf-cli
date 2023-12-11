@@ -27,11 +27,10 @@ from securesystemslib.signer import Signer  # type: ignore
 from securesystemslib.signer import SSlibSigner  # type: ignore
 from securesystemslib.signer import KEY_FOR_TYPE_AND_SCHEME
 from securesystemslib.signer import SSlibKey as Key  # type: ignore
-from tuf.api.exceptions import UnsignedMetadataError
 from tuf.api.metadata import SPECIFICATION_VERSION, Metadata, Role, Root
 from tuf.api.serialization.json import JSONSerializer
 
-from repository_service_tuf.constants import KeyType
+from repository_service_tuf.constants import SCHEME_DEFAULTS, KeyType
 
 console = Console()
 
@@ -219,27 +218,24 @@ class MetadataInfo:
         for keyid in self._new_md.signed.roles["root"].keyids:
             key = self._new_md.signed.keys[keyid]
             name = self._get_key_name(key)
-            if name == key_name:
+            # We accept full name match, but also if the user used a prefix
+            # of the keyid, then we can accept that.
+            if name == key_name or key.keyid.startswith(key_name):
                 self._new_md.signed.revoke_key(keyid, Root.type)
                 return True
 
         return False
 
-    def new_signing_keys_required(self):
+    def new_keys_required(self):
         """
-        Get the number of additional signing keys needed when taking into
+        Get the number of additional keys needed when taking into
         account the keys from the trusted root.
         """
-        # Count only the signing keys still left in new_root
-        signing_keys_amount = 0
-        for keyid in self.signing_keys:
-            if keyid in self._new_md.signed.roles["root"].keyids:
-                signing_keys_amount += 1
-
-        if self.threshold <= signing_keys_amount:
+        # Count only keys still left in new_root
+        if self.threshold <= len(self._new_md.signed.roles["root"].keyids):
             return 0
 
-        return self.threshold - signing_keys_amount
+        return self.threshold - len(self._new_md.signed.roles["root"].keyids)
 
     def add_key(self, new_key: RSTUFKey) -> None:
         """Add a new root key."""
@@ -248,7 +244,10 @@ class MetadataInfo:
             tuf_key.unrecognized_fields["name"] = new_key.name
 
         self._new_md.signed.add_key(tuf_key, Root.type)
-        self.signing_keys[new_key.key["keyid"]] = new_key
+        # If a key has a private portion it means it was loaded and can be used
+        # for signing, otherwise we only have its description.
+        if new_key.key.get("private"):
+            self.signing_keys[new_key.key["keyid"]] = new_key
 
     def change_online_key(self, new_online_key: RSTUFKey) -> None:
         """Replace the current online key with a new one."""
@@ -288,26 +287,6 @@ class MetadataInfo:
         for keyid, key in self.signing_keys.items():
             if keyid in new_root_keyids or keyid in trusted_root_keyids:
                 self._new_md.sign(SSlibSigner(key.key), append=True)
-
-        console.print("\nVerifying the new payload...")
-        try:
-            # Verify that the new root is signed by the trusted current root
-            self._trusted_md.verify_delegate(Root.type, self._new_md)
-        except UnsignedMetadataError:
-            trusted_keys_amount = 0
-            for keyid in self._trusted_md.signed.roles["root"].keyids:
-                if keyid in self.signing_keys:
-                    trusted_keys_amount += 1
-
-            t = self._trusted_md.signed.roles["root"].threshold
-            raise click.ClickException(
-                "Not enough loaded keys left from current root: "
-                f"needed {t}, have {trusted_keys_amount}"
-            )
-
-        # Verify that the new root is signed by at least threshold of keys
-        self._new_md.verify_delegate(Root.type, self._new_md)
-        console.print("The new payload is [green]verified[/]")
 
         return {"metadata": {"root": self._new_md.to_dict()}}
 
@@ -483,19 +462,16 @@ def _conform_rsa_key(input_key: str) -> str:
         return input_key
 
 
-def get_key(
-    role: Optional[str] = None,
-    key_type: str = "",
-    ask_name: bool = False,
+def load_key_ask_info(
+    role: Optional[str] = None, ask_name: bool = False
 ) -> RSTUFKey:
+    """Get key info and load it."""
     role = f"{click.style(role, fg='cyan')}`s " if role is not None else ""
-    if key_type == "":
-        key_type = prompt.Prompt.ask(
-            f"\nChoose {role}key type",
-            choices=KeyType.get_all_members(),
-            default=KeyType.KEY_TYPE_ED25519.value,
-        )
-
+    key_type = prompt.Prompt.ask(
+        f"\nChoose {role}key type",
+        choices=KeyType.get_all_members(),
+        default=KeyType.KEY_TYPE_ED25519.value,
+    )
     filepath: str = prompt.Prompt.ask(
         f"Enter the {role}private key [green]path[/]"
     )
@@ -512,6 +488,105 @@ def get_key(
         )
 
     return load_key(filepath, key_type, password, name)
+
+
+def get_key_description(role: str) -> RSTUFKey:
+    """Get key description and store it in RSTUFKey object."""
+    role_cyan = f"{click.style(role, fg='cyan')}`s"
+    key_type = prompt.Prompt.ask(
+        f"\nChoose {role_cyan}key type",
+        choices=KeyType.get_all_members(),
+        default=KeyType.KEY_TYPE_ED25519.value,
+    )
+    allowed_schemes = get_supported_schemes_for_key_type(key_type)
+    # No point of asking the user for choice if there is only 1 scheme.
+    if len(allowed_schemes) == 1:
+        scheme = allowed_schemes[0]
+    else:
+        scheme = prompt.Prompt.ask(
+            f"Choose {role_cyan} [green]public key scheme[/]",
+            choices=allowed_schemes,
+            default=SCHEME_DEFAULTS[key_type],
+        )
+
+    while True:
+        keyid = prompt.Prompt.ask(f"Enter {role_cyan} [green]key id[/]")
+        if keyid.strip() != "":
+            break
+
+    while True:
+        public = prompt.Prompt.ask(
+            f"Enter {role_cyan}`s [green]public key hash[/]"
+        )
+        if public.strip() != "":
+            if key_type == KeyType.KEY_TYPE_RSA.value:
+                public = _conform_rsa_key(public)
+
+            break
+
+    name = prompt.Prompt.ask(
+        f"[Optional] Give a [green]name/tag[/] to the {role_cyan} key",
+        default=keyid[:7],
+        show_default=False,
+    )
+
+    return RSTUFKey(
+        key={
+            "keytype": key_type,
+            "scheme": scheme,
+            "keyid": keyid,
+            "keyid_hash_algorithms": ["sha256", "sha512"],
+            "keyval": {
+                "public": public,
+            },
+        },
+        key_path="N/A (public key only)",
+        name=name,
+    )
+
+
+def get_rstuf_key(
+    role: str,
+    key_count: Optional[int] = None,
+    number_of_keys: Optional[int] = None,
+) -> RSTUFKey:
+    if role == Roles.ROOT.value and key_count == 1:
+        signing_key_type = "private"
+
+    elif role == "ONLINE" or role == "online":
+        signing_key_type = "public"
+    else:
+        signing_key_type = prompt.Prompt.ask(
+            "[cyan]Private[/] or [cyan]Public[/] key"
+            "\n- [cyan]private key[/] requires the file path and password"
+            "\n- [cyan]public info[/] requires the a key id and key hash"
+            "\n  tip: `rstuf key info` retrieves the public information"
+            "\nSelect to use [cyan]private key[/] or [cyan]public "
+            "info[/]?",
+            choices=["private", "public"],
+            default="public",
+        )
+
+    rstuf_key: RSTUFKey
+    if signing_key_type == "private":
+        while True:
+            rstuf_key = load_key_ask_info(role, ask_name=True)
+            if rstuf_key.error:
+                console.print(rstuf_key.error)
+                continue
+            else:
+                break
+
+        if key_count is not None and number_of_keys is not None:
+            console.print(
+                ":white_check_mark: Key "
+                f"{key_count}/{number_of_keys} [green]Verified[/]"
+            )
+
+    else:
+        rstuf_key = get_key_description(role)
+
+    return rstuf_key
 
 
 def load_key(path: str, keytype: str, password: str, name: str) -> RSTUFKey:

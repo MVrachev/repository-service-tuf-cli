@@ -166,7 +166,7 @@ class TestMetadataUpdate:
             ),
             obj=test_context,
         )
-        expected_msg = "Failed loading key 0 of 1"
+        expected_msg = "Failed loading key"
         assert expected_msg in test_result.output
         finish_msg = "No file will be generated as no changes were made"
         assert finish_msg in test_result.output
@@ -443,6 +443,43 @@ class TestMetadataUpdate:
         assert test_result.exit_code == 0
         warning = "You must add 1 more key(s)"
         assert warning in test_result.output
+
+    def test_metadata_update_remove_key_by_custom_keyid_preffix(
+        self, client, test_context, md_update_input
+    ):
+        # Verify that if a key is removed, then another one must be added to
+        # fulfill the threshold requirement
+        input_step1, input_step2, _, _ = md_update_input
+        input_step3 = [
+            "y",  # Do you want to modify root keys? [y/n]
+            "",  # What should be the root role threshold? (CURRENT_KEY_THRESHOLD)  # noqa
+            "y",  # Do you want to remove a key [y/n]
+            "ad1709b3cb419b99c5cd7427d6411522e5a93ae",  # Name/Tag/ID prefix of the key to remove  # noqa
+            "n",  # Do you want to remove a key [y/n]
+            "rsa",  # Choose root key type [ed25519/ecdsa/rsa] (ed25519)
+            "tests/files/key_storage/online-rsa.key",  # Enter the root`s private key path  # noqa
+            "strongPass",  # Enter the root`s private key password
+            "Kairo's Key",  # [Optional] Give a name/tag to the key
+            "n",  # Do you want to add a new key? [y/n]
+            "n",  # Do you want to modify root keys? [y/n]
+        ]
+        # Don't change the online key as otherwise it will try to add a key
+        # used in root.
+        input_step4 = [
+            "n",  # Do you want to change the online key? [y/n]
+        ]
+        test_result = client.invoke(
+            metadata.update,
+            input="\n".join(
+                input_step1 + input_step2 + input_step3 + input_step4
+            ),
+            obj=test_context,
+        )
+        finish_msg = "Ceremony done. 🔐 🎉. Root metadata update completed."
+        assert finish_msg in test_result.output
+        assert test_result.exit_code == 0
+        msg = "Key with name/tag ad1709b3cb419b99c5cd7427d6411522e5a93ae removed\n"  # noqa
+        assert msg in test_result.output
 
     def test_metadata_update_add_curr_online_key(
         self, client, test_context, md_update_input
